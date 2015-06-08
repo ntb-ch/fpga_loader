@@ -4,6 +4,7 @@
  * Copyright (C) 2008 Juergen Beisert <kernel@pengutronix.de>, Pengutronix
  *
  * Modified: 2014 Marco Tinner <marco.tinner@ntb.ch>, NTB Buchs
+ *           2015 Adam Bajric <adam.bajric@ntb.ch>, NTB Buchs
  *
  * This programs free software; you can redistribute it and/or modify
  * it under the terms of the version 2 of the GNU General Public License
@@ -21,44 +22,27 @@
 
 /*
  * Note:
- * The external FPGA device is an Altera Cyclone II, type EP2C8F256C8N
+ * The external FPGA device is an Altera Cyclone IV, type EP4CE22F17C8
  *
  * It can be feed by an external serial flash device or by some GPIOs from
  * CPU side.
- *
- * Loading from external serial flash at reset time:
- * - in this case PSC6 can be used as an additional UART.
- * - JP11 must be open and R31 assembled
- * - JP8 must be closed at 1-2 to select "Active Serial Mode"
- * - U18 (EPCS4N/25P20) must be assembled
- *
- * Loading from the CPU at runtime:
- * - in this case PSC6 cannot be used as a UART, or if possible, not routed
- *   to the external pins while loading the FPGA
- * - in the case J11 is closed at 1-2
- *    - GPIO6 from CPU must be high
- * - in the case J11 is closed at 3-2
- *    - GPIO6 from CPU is free for alternative usage
- * - J8 must be closed at 2-3 to select "Passive Serial Mode"
  *
  * Now its possible to control:
  *
  * FPGA's             CPUs
  *  pin     through    pin
  * ---------------------------
- *  DCLK (in)        PSC6_3 (out)
- *  DATA0 (in)       PSC6_2 (out)
- *  CONFIG# (in)     PSC6_1 (out)
- *  DONE (out)       PSC6_0 (in)
- *  STATUS (out)     GPIO7 (in)
+ *  DCLK (in)        FPGA_CONFIG_DCLK    (out) bank 2 bit 31
+ *  DATA0 (in)       FPGA_CONFIG_DATA0   (out) bank 3 bit 29
+ *  CONFIG# (in)     FPGA_CONFIG_nCONFIG (out) bank 5 bit  4
+ *  DONE (out)       FPGA_CONFIG_DONE    (in)  bank 1 bit 11
+ *  STATUS (out)     FPGA_CONFIG_nSTATUS (in)  bank 3 bit 27
  *
  *
- * When loading this module the PSC6 is temporarily configured for GPIO use. 
  * From userspace you can use the file copy command to load the FPGA as given in the following example
  *
  * dd if=<design_name>.rbf of=/dev/fpga_loader bs=5M
  *
- * Finally, this module can be unloaded and the UART function will be available again.
  */
 
 
@@ -70,221 +54,81 @@
 #include <linux/ioport.h>
 #include <asm/io.h>
 #include <asm/uaccess.h>
-#include <asm/mpc52xx.h>
 #include <linux/slab.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/gpio.h>
+
 
 #define MAJOR_NR 140
 #define MINOR_NR 0
 #define N_OF_DEV 1
 #define MODULE_NAME "fpga loader"
 #define TIMEOUT 20000
-#define MAX_FIRMWARE_SIZE 130000
+#define MAX_FIRMWARE_SIZE 4194304
 
 
 static dev_t dev;
 static struct cdev *cdev;
 struct class *fpga_loader_class;
-static struct mpc52xx_gpio __iomem *gpio;
-static struct mpc52xx_gpio_wkup __iomem *wkup;
 static int number_of_writes = 0;
-static u32 port_config_backup;
-static u32 simple_gpioe_backup;
-static u32 simple_ddr_backup;
-static u8 wkup_gpioe_backup;
-static u8 wkup_ddr_backup;
 static u8 *buf = NULL;
 
-
-static void set_dclk(void)
+enum
 {
-	u32 data;
+	FPGA_CONFIG_nCONFIG = 63,
+	FPGA_CONFIG_nSTATUS = 93,
+	FPGA_CONFIG_DCLK = 132,
+	FPGA_CONFIG_DATA0 = 11,
+	FPGA_CONFIG_DONE = 91
+};
 
-	data = in_be32(&gpio->simple_dvo);
-	data |= 0x20000000;
-	out_be32(&gpio->simple_dvo, data);
-}
-
-static void clear_dclk(void)
+static struct gpio fpga_gpios[] =
 {
-	u32 data;
+	{ FPGA_CONFIG_nCONFIG, GPIOF_OUT_INIT_HIGH, "nCONFIG" },
+	{ FPGA_CONFIG_nSTATUS, GPIOF_IN,            "nSTATUS" },
+	{ FPGA_CONFIG_DCLK,    GPIOF_OUT_INIT_LOW,  "DCLK"    },
+	{ FPGA_CONFIG_DATA0,   GPIOF_OUT_INIT_LOW,  "DATA0"   },
+	{ FPGA_CONFIG_DONE,    GPIOF_IN,            "DONE"    }
+};
 
-	data = in_be32(&gpio->simple_dvo);
-	data &= ~0x20000000;
-	out_be32(&gpio->simple_dvo, data);
-}
 
-static void set_data(void)
-{
-	u32 data;
+static void set_dclk(void)     { gpio_set_value(FPGA_CONFIG_DCLK, 1); }
+static void clear_dclk(void)   { gpio_set_value(FPGA_CONFIG_DCLK, 0); }
 
-	data = in_be32(&gpio->simple_dvo);
-	data |= 0x10000000;
-	out_be32(&gpio->simple_dvo, data);
-}
+static void set_data(void)     { gpio_set_value(FPGA_CONFIG_DATA0, 1); }
+static void clear_data(void)   { gpio_set_value(FPGA_CONFIG_DATA0, 0); }
 
-static void clear_data(void)
-{
-	u32 data;
+static void set_config(void)   { gpio_set_value(FPGA_CONFIG_nCONFIG, 1); }
+static void clear_config(void) { gpio_set_value(FPGA_CONFIG_nCONFIG, 0); }
 
-	data = in_be32(&gpio->simple_dvo);
-	data &= ~0x10000000;
-	out_be32(&gpio->simple_dvo, data);
-}
+static int read_done(void)     { return gpio_get_value(FPGA_CONFIG_DONE); }
 
-static void set_config(void)
-{
-	u8 config;
+static int read_status(void)   { return gpio_get_value(FPGA_CONFIG_nSTATUS); }
 
-	config = in_8(&wkup->wkup_dvo);
-	config |= 0x20;
-	out_8(&wkup->wkup_dvo, config);
-}
-
-static void clear_config(void)
-{
-	u8 config;
-
-	config = in_8(&wkup->wkup_dvo);
-	config &= ~0x20;
-	out_8(&wkup->wkup_dvo, config);
-}
-
-static int read_done(void)
-{
-	return (!!(in_8(&wkup->wkup_ival) & 0x10));
-}
-
-static int read_status(void)
-{
-	return (!!(in_8(&wkup->wkup_ival) & 0x80));
-}
-
-static void __iomem *mpc52xx_find_and_map(const char *compatible)
-{
-	struct device_node *ofn;
-	const u32 *regaddr_p;
-	u64 regaddr64, size64;
-	
-	ofn = of_find_compatible_node(NULL, NULL, compatible);
-	if (!ofn){
-		pr_err("%s: of_find_compatible_node error\n", __FUNCTION__);
-		return NULL;	
-	}
-
-	regaddr_p = of_get_address(ofn, 0, &size64, NULL);
-	if (!regaddr_p) {
-		pr_err("%s: of_get_address error\n", __FUNCTION__);
-		of_node_put(ofn);
-		return NULL;
-	}
-
-	regaddr64 = of_translate_address(ofn, regaddr_p);
-
-	of_node_put(ofn);
-
-	return ioremap((u32)regaddr64, (u32)size64);
-}
 
 static void init_gpio_fpga(void)
 {
-	u32 port_config, simple_gpioe, simple_ddr;
-	u8 wkup_gpioe, wkup_ddr, wkup_dvo;
-
-	/* set port to configure IRDA as GPIO */
-	port_config_backup = port_config = in_be32(&gpio->port_config);
-	port_config &= ~0x00700000;
-	out_be32(&gpio->port_config, port_config);
-
-	/* enabling GPIO_IRDA_0, GPIO_IRDA_1 */
-	simple_gpioe = simple_gpioe_backup = in_be32(&gpio->simple_gpioe);
-	simple_gpioe |= 0x30000000;
-	out_be32(&gpio->simple_gpioe, simple_gpioe);
-
-	/* set GPIO_IRDA_0 as out(Bit 2 low), GPIO_IRDA_1 as out(Bit 3 high)*/
-	simple_ddr = simple_ddr_backup = in_be32(&gpio->simple_ddr);
-	simple_ddr |= 0x30000000;
-	out_be32(&gpio->simple_ddr, simple_ddr);
-
-	/* enabling GPIO_WKUP_4, GPIO_WKUP_5, GPIO_WKUP_6, GPIO_WKUP_7 */
-	wkup_gpioe = wkup_gpioe_backup = in_8(&wkup->wkup_gpioe);
-	wkup_gpioe |= 0xF0;
-	out_8(&wkup->wkup_gpioe, wkup_gpioe);
-
-	/* set GPIO_WKUP_7, GPIO_4 as in (Bit 0 and Bit 3 low) and GPIO_WKUP_5,
-	 * GPIO_WKUP_6 as out (Bit 1 and 2 high) */
-	wkup_ddr = wkup_ddr_backup = in_8(&wkup->wkup_ddr);
-	wkup_ddr &= ~0x90;
-	wkup_ddr |= 0x60;
-	out_8(&wkup->wkup_ddr, wkup_ddr);
-
-	/* switch the multiplexer to drive the FPGA lines of instead the UART ones */
-	wkup_dvo = in_8(&wkup->wkup_dvo);
-	wkup_dvo |= 0x40;	/* GPIO6 aka GPIO_WKUP_6 */
-	out_8(&wkup->wkup_dvo, wkup_dvo);
-
-	/* set config(GPIO_WKUP_5) to low and wait 50 us till the  */
-	/* initialization of the datatransfer */
 	clear_config();
 	udelay(50);
 	/*set config to high and wait till device ready (high on status)*/
 	set_config();
 }
 
-static void exit_gpio_fpga(void)
-{
-	u8 wkup_dvo;
-
-	/* switch the multiplexer to drive the UART lines instead of the FPGA ones */
-		
-	wkup_dvo = in_8(&wkup->wkup_dvo);
-	wkup_dvo &= ~0x40;	/* GPIO6 aka GPIO_WKUP_6 */
-	out_8(&wkup->wkup_dvo, wkup_dvo);
-	
-	/* restore previous settings */
-	out_8(&wkup->wkup_ddr, wkup_ddr_backup);
-	out_8(&wkup->wkup_gpioe, wkup_gpioe_backup);
-	out_be32(&gpio->simple_ddr, simple_ddr_backup);
-	out_be32(&gpio->simple_gpioe, simple_gpioe_backup);
-	out_be32(&gpio->port_config, port_config_backup);
-
-}
-
 static int map_resources(void)
 {
-	gpio = mpc52xx_find_and_map("fsl,mpc5200-gpio");
-	wkup = mpc52xx_find_and_map("fsl,mpc5200-gpio-wkup");
-
-	if(!gpio){
-		pr_err("%s: error while mapping GPIO\n", __FUNCTION__);
-	}
-
-	if(!wkup){
-		pr_err("%s: error while mapping GPIO_WKUP\n", __FUNCTION__);
-	}
-
-	if (!gpio || !wkup) {
-		return -1;
-	}
-
-	return 0;
+	return gpio_request_array(fpga_gpios, ARRAY_SIZE(fpga_gpios));
 }
 
-static int unmap_resources(void)
+static void unmap_resources(void)
 {
-	if (gpio) {
-		iounmap(gpio);
-		gpio = NULL;
-	}
-	if (wkup) {
-		iounmap(wkup);
-		wkup = NULL;
-	}
-
-	return 0;
+	gpio_free_array(fpga_gpios, ARRAY_SIZE(fpga_gpios));
 }
 
-int open (struct inode *i, struct file *f){
+int open (struct inode *i, struct file *f)
+{
 	number_of_writes = 0;
+
 	return 0;
 }
 
@@ -294,10 +138,10 @@ int release (struct inode *i, struct file *f){
 
 ssize_t write(struct file *f, const char __user *data, size_t file_size, loff_t *offs ){
 	int bits_transferred = 0, size, timeout = TIMEOUT;
-	u8 conf_done, status;
+	u8 conf_done;
 	number_of_writes++;
 	if(file_size > MAX_FIRMWARE_SIZE){
-		printk(KERN_ALERT "[%s]: Error File is to big!\n", MODULE_NAME);
+		printk(KERN_ALERT "[%s]: Error File is too big!\n", MODULE_NAME);
 		return -EFBIG;
 	}
 
@@ -308,10 +152,10 @@ ssize_t write(struct file *f, const char __user *data, size_t file_size, loff_t 
 	memcpy(buf,data,file_size);
 	size = file_size;
 	while (1) {
-		status = read_status();
-		if (status)
+		if (read_status())
 			break;
 		if (timeout <= 0) {
+			printk(KERN_ALERT "[%s]: timeout\n", MODULE_NAME);
 			return -ENODEV;
 		}
 		timeout--;
@@ -401,7 +245,6 @@ static int __init fpga_init(void)
 	cdev_add_fail:
 		unregister_chrdev_region(dev, N_OF_DEV);
 	reg_dev_reg_fail:
-		exit_gpio_fpga();
 		unmap_resources();
 	map_res_fail:
 	return error;	
@@ -411,7 +254,6 @@ static int __init fpga_init(void)
 static void __exit fpga_exit(void)
 {
 	kfree(buf);
-	exit_gpio_fpga();
 	unmap_resources();
 	device_destroy(fpga_loader_class, dev);
 	class_destroy(fpga_loader_class);
@@ -422,7 +264,7 @@ static void __exit fpga_exit(void)
 
 module_init(fpga_init);
 module_exit(fpga_exit);
-MODULE_AUTHOR("Luotao Fu, Juergen Beisert, Tinner Marco");
+MODULE_AUTHOR("Luotao Fu, Juergen Beisert, Tinner Marco, Adam Bajric");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("FPGA Loader on pcm032 Board");
+MODULE_DESCRIPTION("FPGA Loader on iMX6");
 
