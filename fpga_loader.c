@@ -3,8 +3,10 @@
  * Copyright (C) 2006 Luotao Fu <lfu@pengutronix.de>, Pengutronix
  * Copyright (C) 2008 Juergen Beisert <kernel@pengutronix.de>, Pengutronix
  *
- * Modified: 2014 Marco Tinner <marco.tinner@ntb.ch>, NTB Buchs
- *           2015 Adam Bajric <adam.bajric@ntb.ch>, NTB Buchs
+ * Modified: 
+ *      2014 Marco Tinner <marco.tinner@ntb.ch>, NTB Buchs
+ *      2015 Adam Bajric <adam.bajric@ntb.ch>, NTB Buchs
+ *      2018 Andreas Kunz <andreas.kunz@ntb.ch>, NTB Buchs
  *
  * This programs free software; you can redistribute it and/or modify
  * it under the terms of the version 2 of the GNU General Public License
@@ -149,7 +151,12 @@ ssize_t write(struct file *f, const char __user *data, size_t file_size, loff_t 
 		printk(KERN_ALERT "[%s]: Error File has to be writen in one chunk!\n For example use: dd if=.. of=.. bs=5M\n", MODULE_NAME);
 		return -EIO;
 	}
-	memcpy(buf,data,file_size);
+
+	if ( __copy_from_user (buf, data, file_size) ) {
+		printk(KERN_ALERT "[%s]: Copy data from user space failed in function: __copy_from_user()!\n", MODULE_NAME);
+		return -EIO;
+	}
+
 	size = file_size;
 	while (1) {
 		if (read_status())
@@ -264,7 +271,7 @@ static void __exit fpga_exit(void)
 
 module_init(fpga_init);
 module_exit(fpga_exit);
-MODULE_AUTHOR("Luotao Fu, Juergen Beisert, Tinner Marco, Adam Bajric");
+MODULE_AUTHOR("Luotao Fu, Juergen Beisert, Tinner Marco, Adam Bajric, Andreas Kunz");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("FPGA Loader on iMX6");
 
