@@ -55,7 +55,7 @@
 #include <linux/cdev.h>
 #include <linux/ioport.h>
 #include <asm/io.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/device.h>
