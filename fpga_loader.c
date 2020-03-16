@@ -207,6 +207,16 @@ ssize_t write(struct file *f, const char __user *data, size_t file_size, loff_t 
 	printk(KERN_DEBUG "\n[%s]: done \n", MODULE_NAME);
 	printk(KERN_DEBUG "[%s]: config done status: %i \n", MODULE_NAME,conf_done ? 1:0);
 	printk(KERN_DEBUG "[%s]: transferred bits: %d \n", MODULE_NAME,bits_transferred);
+
+	// the FPGA needs 2 extra cycles to transition to user mode
+	udelay(2);
+	set_dclk();
+	udelay(2);
+	clear_dclk();
+	udelay(2);
+	set_dclk();
+	udelay(2);
+	clear_dclk();
 	return size;
 	
 }
