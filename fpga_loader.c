@@ -196,7 +196,7 @@ ssize_t write(struct file *f, const char __user *data, size_t file_size, loff_t 
 		if (!(++bits_transferred % 8))
 			buf++;
 
-		if(!(bits_transferred % 8192))
+		if(!(bits_transferred % 65536))
 			printk(".");
 
 		if (bits_transferred > size * 8){
